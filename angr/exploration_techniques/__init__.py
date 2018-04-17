@@ -178,6 +178,7 @@ from .lengthlimiter import LengthLimiter
 from .veritesting import Veritesting
 from .oppologist import Oppologist
 from .director import Director, ExecuteAddressGoal, CallFunctionGoal
+from .skippy import Skippy
 from .spiller import Spiller
 from .manual_mergepoint import ManualMergepoint
 from .tech_builder import TechniqueBuilder

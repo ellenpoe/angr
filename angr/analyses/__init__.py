@@ -18,6 +18,7 @@ from .bindiff import BinDiff
 from .dfg import DFG
 from .loopfinder import LoopFinder
 from .congruency_check import CongruencyCheck
+from .skippy import Skippy
 from .static_hooker import StaticHooker
 from .reassembler import Reassembler
 from .binary_optimizer import BinaryOptimizer
