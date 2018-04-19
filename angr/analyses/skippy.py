@@ -2,7 +2,10 @@ import angr
 import claripy
 from . import Analysis
 import IPython
-from copy import copy
+from copy import copy, deepcopy
+
+def add_constraints(solver, constraints):
+    solver.add(*constraints)
 
 class SkippyMemWrite:
     def __init__(self, addr, size, rbp=None):
@@ -25,64 +28,98 @@ class SkippyMemWrite:
             return None
         return clobber_bvs
 
+class SkippySatCheckerChain:
+    def __init__(self, my_sat_checker, prev_chain_link=None):
+        self.my_sat_checker = my_sat_checker
+        self.prev_chain_link = prev_chain_link
+        self.counter = 0
+        pass
+
+    def is_satisfiable(self, proj, state_to_check):
+        for _ in self.check_satisfiability(proj, state_to_check):
+            return True;
+        return False;
+
+    def check_satisfiability(self, proj, state_to_check):
+        if self.prev_chain_link is not None:
+            all_starting_constraints = self.prev_chain_link.check_satisfiability(proj, state_to_check)
+        else:
+            all_starting_constraints = [frozenset()]
+
+        for starting_constraints in all_starting_constraints:
+            for constraints in self.my_sat_checker.check_satisfiability(proj, state_to_check, starting_constraints):
+                yield frozenset(constraints | starting_constraints)
+
+        return
+
 class SkippySatChecker:
-    def __init__(self, clobbered_mem_map, clobbered_reg_map, loop, rbp):
+    def __init__(self, clobbered_mem_map, clobbered_reg_map, loop, rbp, exit_addr):
         self.initial_state = None
         self.clobbered_mem_map = clobbered_mem_map
         self.clobbered_reg_map = clobbered_reg_map
         self.loop = loop
         self.rbp = rbp
+        self.exit_addr = exit_addr
 
     def set_initial_state(self, initial_state):
         self.initial_state = initial_state;
 
-    def check_satisfiabilty(self, proj, state_to_check):
+    def check_satisfiability(self, proj, state_to_check, initial_constraints):
         if self.initial_state is None:
             print "didn't have initial state!"
-            return False #TODO throw exception maybe?
+            raise StopIteration
         initial_state = self.initial_state.copy()
+
         initial_state.se.simplify()
+        add_constraints(initial_state.se, state_to_check.se.constraints)
+        add_constraints(initial_state.se, initial_constraints)
+        initial_state.se.simplify()
+
         initial_state.globals['no-skip'] = True
 
         def exit_action(state):
-            state.globals['sat-exiting'] = True
+            state.globals['sat-exiting'] = state.addr
         exit_blocks = [finish.addr for start,finish in self.loop.break_edges]
         for addr in exit_blocks:
             initial_state.inspect.b('instruction', when=angr.BP_BEFORE, instruction=addr, action=exit_action)
 
         simgr = proj.factory.simgr(initial_state)
-        initial_constraints = self._constraints_involving_vals(initial_state, self.clobbered_mem_map.values() + self.clobbered_reg_map.values())
 
         while len(simgr.active) > 0 and len(simgr.active) < 10:
             simgr.step()
             for state in simgr.active:
                 if 'sat-exiting' not in state.globals.keys():
                     continue
+                if state.globals['sat-exiting'] != self.exit_addr:
+                    simgr.stash(filter_func=lambda s: s == state)
+                    continue
 
+                # print 'output:', state.posix.dump_fd(0).strip()
                 candidate = state.copy()
                 final_state = state_to_check.copy()
 
-                non_clobbered_vals = set()
+                value_constraints = []
+                clobbered_vals = []
                 for addr, clobbered_val in self.clobbered_mem_map.iteritems():
-                    memcell = candidate.memory.load(addr=addr.replace(self.rbp, candidate.regs.rbp), size=clobbered_val.size()/8)
-                    non_clobbered_vals.add(memcell)
-                    final_state.se.add(memcell == clobbered_val)
+                    memcell = candidate.memory.load(addr=addr.replace(self.rbp, self.initial_state.regs.rbp), size=clobbered_val.size()/8)
+                    value_constraints.append(memcell == clobbered_val)
+                    clobbered_vals.append(clobbered_val)
 
                 for addr, clobbered_val in self.clobbered_reg_map.iteritems():
-                    non_clobbered_vals.add(candidate.registers.mem[addr].object)
-                    final_state.se.add(candidate.registers.mem[addr].object == clobbered_val)
+                    value_constraints.append(candidate.registers.mem[addr].object == clobbered_val)
+                    clobbered_vals.append(clobbered_val)
 
-                new_constraints = [constraint for constraint in candidate.se.constraints if constraint not in initial_constraints]
+                final_state_constraints = frozenset(final_state.se.constraints)
+                new_constraints = [c for c in candidate.se.constraints if c not in final_state_constraints]
 
-                candidate_constraints = self._constraints_involving_vals(new_constraints, non_clobbered_vals)
-
-                final_state.se.add(*candidate_constraints)
+                # final_state.se.simplify()
+                add_constraints(final_state.se, value_constraints)
+                add_constraints(final_state.se, new_constraints)
+                # final_state.se.simplify()
+                # print new_constraints
                 if final_state.se.satisfiable():
-                    return True
-                else:
-                    simgr.stash(filter_func=lambda s: s == state)
-
-        return False
+                    yield frozenset(new_constraints + value_constraints)
+                simgr.stash(filter_func=lambda s: s == state)
 
     def _value_in_ast(self, value, ast):
         if isinstance(value, (int, long)):
@@ -95,7 +132,6 @@ class SkippySatChecker:
             return False
 
     def _constraints_involving_vals(self, constraints, values):
-        constraints = []
         for constraint in constraints:
             for value in values:
                 if self._value_in_ast(value, constraint):
@@ -132,8 +168,7 @@ class SkippyHook:
             new_state.scratch.guard = new_state.se.true
             new_state.history.jumpkind = 'Ijk_Boring'
 
-            new_state.globals['new_sat_checks'] = copy(new_state.globals['new_sat_checks'])
-            new_state.globals['new_sat_checks'].append(SkippySatChecker(clobbered_mem_map, clobbered_reg_map, self.loop, self.rbp))
+            new_state.globals['new_sat_check'] = SkippySatChecker(clobbered_mem_map, clobbered_reg_map, self.loop, self.rbp, finish.addr)
 
             successors.append(new_state)
 

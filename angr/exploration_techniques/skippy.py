@@ -5,6 +5,7 @@ import itertools
 from copy import copy
 
 from . import ExplorationTechnique
+from ..analyses.skippy import SkippySatCheckerChain
 
 class Skippy(ExplorationTechnique):
 
@@ -17,21 +18,19 @@ class Skippy(ExplorationTechnique):
             self.project.hook(hook.get_hook_addr(), hook=hook.skip_loop)
 
     def step_state(self, simgr, state, successor_func=None, **kwargs):
-        if 'new_sat_checks' not in state.globals.keys():
-            state.globals['new_sat_checks'] = []
-        if 'sat_checks' not in state.globals.keys():
-            state.globals['sat_checks'] = []
-
-        before_sat_checkers = len(state.globals['sat_checks'])
+        if 'new_sat_check' not in state.globals.keys():
+            state.globals['new_sat_check'] = None
+        if 'sat_chain' not in state.globals.keys():
+            state.globals['sat_chain'] = None
 
         update = simgr.step_state(state, **kwargs)
         # IPython.embesd()
         for new_state in list(itertools.chain(*update.values())):
-            new_state.globals['sat_checks'] = copy(new_state.globals['sat_checks'])
-            if len(new_state.globals['new_sat_checks']) > 0:
-                for sat_check in new_state.globals['new_sat_checks']:
-                    sat_check.set_initial_state(state)
-                    new_state.globals['sat_checks'].append(sat_check)
-            new_state.globals['new_sat_checks'] = []
+            # new_state.globals['sat_checks'] = copy(new_state.globals['sat_checks'])
+            if new_state.globals['new_sat_check'] is not None:
+                sat_check = new_state.globals['new_sat_check']
+                sat_check.set_initial_state(state)
+                new_state.globals['sat_chain'] = SkippySatCheckerChain(sat_check, prev_chain_link=new_state.globals['sat_chain'])
+            new_state.globals['new_sat_check'] = None
 
         return update
