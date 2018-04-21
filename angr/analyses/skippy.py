@@ -212,11 +212,19 @@ class Skippy(Analysis):
         super(Skippy, self).__init__()
         self.loop_finder = loop_finder
         self.hooks = []
+        self.valid = True
         for loop in loops_to_skip:
-            analysis_result = self._analyze_loop(loop)
-            if analysis_result is not None:
-                mem_writes, reg_writes, rbp = analysis_result
-                self.hooks.append(SkippyHook(loop, rbp, mem_writes, reg_writes))
+            try:
+                analysis_result = self._analyze_loop(loop)
+                if analysis_result is not None:
+                    mem_writes, reg_writes, rbp = analysis_result
+                    self.hooks.append(SkippyHook(loop, rbp, mem_writes, reg_writes))
+                    print 'skipped loop', loop
+                else:
+                    print 'bad loop?', loop
+            except:
+                print 'bad loop', loop
+        print 'hooked {} loops'.format(len(self.hooks))
 
     def get_hooks(self):
         return self.hooks
@@ -253,12 +261,14 @@ class Skippy(Analysis):
             size = state.inspect.mem_write_length
             if not size.concrete:
                 print "skippy doesn't know how to deal with symbolic-size writes"
+                self.valid = False
                 return
 
             if self._concrete_or_rbp(const_rbp, addr):
                 mem_writes.append(SkippyMemWrite(addr, size.args[0], rbp=const_rbp))
             else:
                 print "skippy doesn't know how to deal with symbolic writes yet"
+                self.valid = False
 
         def reg_write_action(state):
             if state.inspect.reg_write_offset in written_reg_addresses:
@@ -299,11 +309,20 @@ class Skippy(Analysis):
                     return None
             return 'exited'
 
-        simgr = self.project.factory.simgr(initial_state)
-        while len(simgr.active) != 0:
+        import time
+        simgr = self.project.factory.simgr(initial_state, veritesting=True)
+        start_time = time.time()
+        while len(simgr.active) > 0 and len(simgr.active) < 15 and time.time() < start_time + 10:
             simgr.step(filter_func=filter_func_rough, num_inst=1)
+            if self.valid == False:
+                raise Exception()
         while len(simgr.stashes['exiting']) != 0:
             simgr.step(filter_func=filter_func_fine, num_inst=1, stash='exiting')
+            if self.valid == False:
+                raise Exception()
+
+        if len(simgr.active) != 0:
+            raise Exception()
 
         return mem_writes, reg_writes, const_rbp
 
