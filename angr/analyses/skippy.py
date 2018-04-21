@@ -21,6 +21,18 @@ class SkippyMemWrite:
             addr = addr.replace(self.rbp, state.regs.rbp.ast)
         memcell = state.mem[addr]
         clobber_bvs = claripy.BVS("clobber_bvs", self.size*8)
+        if self.size == 1:
+            memcell.uint8_t = clobber_bvs
+        elif self.size == 2:
+            memcell.uint16_t = clobber_bvs
+        elif self.size == 4:
+            memcell.uint32_t = clobber_bvs
+        elif self.size == 8:
+            memcell.uint64_t = clobber_bvs
+        else:
+            print "skippy doesn't know how to deal with weird-sized writes"
+            return None
+
         if self.offset is not None:
             state.se.add(clobber_bvs == self.offset + state.memory.load(addr=addr, size=self.size))
         return addr, clobber_bvs
@@ -49,14 +61,10 @@ class SkippySatCheckerChain:
         for starting_constraints in all_starting_constraints:
             constraints = []
             for constraint_set in self.my_sat_checker.check_satisfiability(proj, state_to_check, starting_constraints):
-                constraints.append(claripy.And(*constraint_set))
-
-            constraint_disjunction = claripy.Or(*constraints)
-
-            if starting_constraints is not None:
-                yield claripy.And(constraint_disjunction, starting_constraints)
-            else:
-                yield constraint_disjunction
+                if starting_constraints is not None:
+                    yield claripy.And(claripy.And(*constraint_set), starting_constraints)
+                else:
+                    yield claripy.And(*constraint_set)
 
         return
 
@@ -69,7 +77,6 @@ class SkippySatChecker:
         self.rbp = rbp
         self.exit_addr = exit_addr
         self.exit_state_cache = {}
-        self.exit_state_sat_cache = {}
 
     def set_initial_state(self, initial_state):
         self.initial_state = initial_state;
@@ -79,29 +86,31 @@ class SkippySatChecker:
             print "didn't have initial state!"
             raise StopIteration
 
-        if True or proj not in self.exit_state_cache.keys():
+        initial_state = self.initial_state.copy()
 
-            initial_state = self.initial_state.copy()
+        if state_to_check not in self.exit_state_cache.keys():
+            self.exit_state_cache[state_to_check] = []
 
-            # add_constraints(initial_state.se, state_to_check.se.constraints)
+        all_initial_constraints = state_to_check.se.constraints + [claripy.Not(claripy.Or(*self.exit_state_cache[state_to_check]))]
+        if initial_constraints is not None:
+            all_initial_constraints += [initial_constraints]
+        add_constraints(initial_state.se, all_initial_constraints)
+        self.exit_state_cache[state_to_check].append(all_initial_constraints)
 
-            initial_state.globals['no-skip'] = True
+        print 'trying to satisfy', state_to_check.posix.dump_fd(0).strip()
+        print 'using constrained input', initial_state.posix.dump_fd(0).strip()
 
-            def exit_action(state):
-                state.globals['sat-exiting'] = state.addr
-            exit_blocks = [finish.addr for start,finish in self.loop.break_edges]
-            for addr in exit_blocks:
-                initial_state.inspect.b('instruction', when=angr.BP_BEFORE, instruction=addr, action=exit_action)
+        initial_state.globals['no-skip'] = True
 
-            simgr = proj.factory.simgr(initial_state)
-            self.exit_state_cache[proj] = simgr, []
-        else:
-            simgr = self.exit_state_cache[proj][0]
-            for to_yield in self.exit_state_cache[proj][1]:
-                yield to_yield
+        def exit_action(state):
+            state.globals['sat-exiting'] = state.addr
+        exit_blocks = [finish.addr for start,finish in self.loop.break_edges]
+        for addr in exit_blocks:
+            initial_state.inspect.b('instruction', when=angr.BP_BEFORE, instruction=addr, action=exit_action)
 
+        simgr = proj.factory.simgr(initial_state, veritesting=True)
 
-        while len(simgr.active) > 0 and len(simgr.active) < 10:
+        while len(simgr.active) > 0:
             simgr.step()
             for state in simgr.active:
                 if 'sat-exiting' not in state.globals.keys():
@@ -129,18 +138,11 @@ class SkippySatChecker:
                 new_constraints = [c for c in candidate.se.constraints if c not in initial_state_constraints]
 
                 to_yield = frozenset(new_constraints + value_constraints)
-                self.exit_state_cache[proj][1].append(to_yield)
 
-                # final_state.se.simplify()
-                add_constraints(final_state.se, value_constraints)
-                add_constraints(final_state.se, new_constraints)
+                add_constraints(final_state.se, to_yield)
                 if initial_constraints is not None:
                     final_state.se.add(initial_constraints)
-                # add_constraints(final_state.se, state_to_check.se.constraints)
-                # add_constraints(final_state.se, initial_constraints)
 
-                # final_state.se.simplify()
-                # print new_constraints
                 if final_state.se.satisfiable():
                     yield to_yield
 
@@ -230,10 +232,23 @@ class Skippy(Analysis):
         mem_writes = list()
         reg_writes = list()
 
-        def write_action(state):
-            rbp_offset = state.se.eval_one(initial_state_rbp - state.inspect.mem_write_address)
+        written_mem_addresses = set()
+        written_reg_addresses = set()
 
-            addr = const_rbp - rbp_offset
+        def write_action(state):
+            if state.inspect.mem_write_address in written_mem_addresses:
+                return
+            else:
+                written_mem_addresses.add(state.inspect.mem_write_address)
+
+            rbp_offsets = state.se.eval_upto(initial_state_rbp - state.inspect.mem_write_address, n=2)
+            rbp_offset = rbp_offsets[0]
+
+            if abs(rbp_offset) < 0x10000:
+                addr = const_rbp - rbp_offset
+            else:
+                return
+                # addr = state.inspect.mem_write_address
             # print addr, state.inspect.mem_write_address
             size = state.inspect.mem_write_length
             if not size.concrete:
@@ -241,12 +256,16 @@ class Skippy(Analysis):
                 return
 
             if self._concrete_or_rbp(const_rbp, addr):
-                print 'passing in', addr
                 mem_writes.append(SkippyMemWrite(addr, size.args[0], rbp=const_rbp))
             else:
                 print "skippy doesn't know how to deal with symbolic writes yet"
 
         def reg_write_action(state):
+            if state.inspect.reg_write_offset in written_reg_addresses:
+                return
+            else:
+                written_reg_addresses.add(state.inspect.reg_write_offset)
+
             addr = state.inspect.reg_write_offset
             reg_writes.append(SkippyMemWrite(addr, 8)) # Only support x86_64 for now
 
@@ -285,28 +304,6 @@ class Skippy(Analysis):
             simgr.step(filter_func=filter_func_rough, num_inst=1)
         while len(simgr.stashes['exiting']) != 0:
             simgr.step(filter_func=filter_func_fine, num_inst=1, stash='exiting')
-
-        for mem_write in mem_writes:
-
-            constrained_offset = None
-            for exited_state in simgr.stashes['exited']:
-                initial_addr = mem_write.addr
-                exited_addr = mem_write.addr
-                if mem_write.rbp is not None:
-                    initial_addr = initial_addr.replace(const_rbp, initial_state.regs.rbp)
-                    exited_addr = exited_addr.replace(const_rbp, exited_state.regs.rbp)
-
-                initial_memcell = initial_state.memory.load(addr=initial_addr, size=mem_write.size)
-                exited_memcell = exited_state.memory.load(addr=exited_addr, size=mem_write.size)
-                difference_values = exited_state.se.eval_upto(initial_memcell - exited_memcell, n=2)
-                if len(difference_values) == 1:
-                    if constrained_offset is None or constrained_offset == difference_values[0]:
-                        constrained_offset = difference_values[0]
-                    elif constrained_offset != difference_values[0]:
-                        constrained_offset == None
-                        break
-
-            mem_write.set_offset(constrained_offset)
 
         return mem_writes, reg_writes, const_rbp
 
