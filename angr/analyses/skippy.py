@@ -4,6 +4,7 @@ from . import Analysis
 import IPython
 from copy import copy, deepcopy
 import itertools
+from angr import sim_options as o
 
 def add_constraints(solver, constraints):
     solver.add(*constraints)
@@ -96,9 +97,6 @@ class SkippySatChecker:
             all_initial_constraints += [initial_constraints]
         add_constraints(initial_state.se, all_initial_constraints)
         self.exit_state_cache[state_to_check].append(all_initial_constraints)
-
-        print 'trying to satisfy', state_to_check.posix.dump_fd(0).strip()
-        print 'using constrained input', initial_state.posix.dump_fd(0).strip()
 
         initial_state.globals['no-skip'] = True
 
@@ -212,7 +210,6 @@ class Skippy(Analysis):
         super(Skippy, self).__init__()
         self.loop_finder = loop_finder
         self.hooks = []
-        self.valid = True
         for loop in loops_to_skip:
             try:
                 analysis_result = self._analyze_loop(loop)
@@ -222,14 +219,16 @@ class Skippy(Analysis):
                     print 'skipped loop', loop
                 else:
                     print 'bad loop?', loop
-            except:
-                print 'bad loop', loop
+            except Exception as e:
+                print 'bad loop', loop, e
         print 'hooked {} loops'.format(len(self.hooks))
 
     def get_hooks(self):
         return self.hooks
 
     def _analyze_loop(self, loop):
+        self.valid = True
+
         initial_state = self.project.factory.entry_state(addr=loop.entry.addr)
         const_rbp = claripy.BVS("const_rbp", initial_state.regs.rbp.size())
         initial_state_rbp = initial_state.regs.rbp
@@ -252,12 +251,17 @@ class Skippy(Analysis):
             rbp_offsets = state.se.eval_upto(initial_state_rbp - state.inspect.mem_write_address, n=2)
             rbp_offset = rbp_offsets[0]
 
-            if abs(rbp_offset) < 0x10000:
-                addr = const_rbp - rbp_offset
+            if isinstance(state.inspect.mem_write_address, claripy.ast.BV):
+                tmp_addr = state.inspect.mem_write_address.replace(state.regs.rbp, claripy.BVV(0, 64))
+                if tmp_addr.symbolic:
+                    print 'bad write', state.inspect.mem_write_address
+                    self.valid = False
+                    return
+                else:
+                    addr = const_rbp - rbp_offset
             else:
-                return
-                # addr = state.inspect.mem_write_address
-            # print addr, state.inspect.mem_write_address
+                addr = state.inspect.mem_write_address
+
             size = state.inspect.mem_write_length
             if not size.concrete:
                 print "skippy doesn't know how to deal with symbolic-size writes"
@@ -309,22 +313,44 @@ class Skippy(Analysis):
                     return None
             return 'exited'
 
+        simgr = self.project.factory.simgr(initial_state)
+        print 'starting'
+
         import time
-        simgr = self.project.factory.simgr(initial_state, veritesting=True)
         start_time = time.time()
-        while len(simgr.active) > 0 and len(simgr.active) < 15 and time.time() < start_time + 10:
+        while len(simgr.active) > 0:
             simgr.step(filter_func=filter_func_rough, num_inst=1)
             if self.valid == False:
+                print 'not valid'
+                raise Exception()
+            if len(simgr.unconstrained) != 0:
+                print 'simgr has unconstrained states'
+                raise Exception()
+            if len(simgr.active) > 10 or time.time() > start_time + 5:
+                print 'took too long, or state explosion'
                 raise Exception()
         while len(simgr.stashes['exiting']) != 0:
             simgr.step(filter_func=filter_func_fine, num_inst=1, stash='exiting')
             if self.valid == False:
+                print 'not valid'
+                raise Exception()
+            if len(simgr.unconstrained) != 0:
+                print 'simgr has unconstrained states'
                 raise Exception()
 
         if len(simgr.active) != 0:
+            print 'leftover states at loop exit'
             raise Exception()
 
-        return mem_writes, reg_writes, const_rbp
+        if 'continuing' in simgr.stashes.keys():
+            simgr.step(stash='continuing')
+
+        print 'done', simgr.stashes
+
+        if self.valid:
+            return mem_writes, reg_writes, const_rbp
+        else:
+            raise Exception()
 
     def _concrete_or_rbp(self, rbp, val):
         if isinstance(val, (int, long)):
